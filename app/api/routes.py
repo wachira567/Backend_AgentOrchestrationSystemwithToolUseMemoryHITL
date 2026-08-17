@@ -1,50 +1,36 @@
 import uuid
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 from app.memory.db import get_pool
 from app.agents.graph import workflow
+from app.worker.celery_app import execute_agent_workflow
 
 router = APIRouter()
-
-async def execute_task_background(thread_id: str, task_input: str):
-    """Runs the graph in the background, saving state to PostgreSQL."""
-    pool = await get_pool()
-    checkpointer = AsyncPostgresSaver(pool)
-    
-    # Compile the graph with persistent memory enabled
-    app_graph = workflow.compile(
-        checkpointer=checkpointer, 
-        interrupt_before=["escalation_node"]
-    )
-    
-    # The thread_id isolates this execution from all other users concurrently using the system
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    initial_state = {
-        "task_input": task_input,
-        "messages": [HumanMessage(content=task_input)]
-    }
-    
-    # Run the graph. It will execute until finished or interrupted.
-    await app_graph.ainvoke(initial_state, config)
 
 class TaskRequest(BaseModel):
     task: str
 
 @router.post("/tasks")
-async def create_task(request: TaskRequest, background_tasks: BackgroundTasks):
-    """Submit a new task to the agent orchestration system."""
+async def create_task(request: TaskRequest):
+    """Submit a new task to the agent orchestration system via Celery and Redis."""
     thread_id = str(uuid.uuid4())
-    background_tasks.add_task(execute_task_background, thread_id, request.task)
-    return {"thread_id": thread_id, "message": "Task queued for execution."}
+    
+    # Enqueue execution in Celery worker queue
+    task_job = execute_agent_workflow.delay(thread_id, request.task, False)
+    
+    return {
+        "thread_id": thread_id, 
+        "celery_task_id": task_job.id,
+        "message": "Task queued in Redis for Celery worker execution."
+    }
 
 @router.get("/tasks/{thread_id}/state")
 async def get_task_state(thread_id: str):
-    """Check the current status and memory of the agent graph."""
+    """Check the current status and memory of the agent graph from PostgreSQL checkpointer."""
     pool = await get_pool()
     checkpointer = AsyncPostgresSaver(pool)
     app_graph = workflow.compile(checkpointer=checkpointer, interrupt_before=["escalation_node"])
@@ -70,8 +56,8 @@ class ApprovalRequest(BaseModel):
     feedback: str = ""
 
 @router.post("/tasks/{thread_id}/approve")
-async def approve_task(thread_id: str, request: ApprovalRequest, background_tasks: BackgroundTasks):
-    """Resume a paused task after human review."""
+async def approve_task(thread_id: str, request: ApprovalRequest):
+    """Resume a paused task after human review using Celery worker."""
     pool = await get_pool()
     checkpointer = AsyncPostgresSaver(pool)
     app_graph = workflow.compile(checkpointer=checkpointer, interrupt_before=["escalation_node"])
@@ -82,12 +68,14 @@ async def approve_task(thread_id: str, request: ApprovalRequest, background_task
     if "escalation_node" not in state.next:
         raise HTTPException(status_code=400, detail="Task is not waiting for human approval.")
         
-    async def resume_graph():
-        # Resuming with 'None' tells LangGraph to continue from where it paused
-        await app_graph.ainvoke(None, config)
-        
-    background_tasks.add_task(resume_graph)
-    return {"message": "Task execution resumed."}
+    # Dispatch resume task to Celery worker
+    task_job = execute_agent_workflow.delay(thread_id, None, True)
+    
+    return {
+        "thread_id": thread_id,
+        "celery_task_id": task_job.id,
+        "message": "Task execution resumed and dispatched to Celery worker."
+    }
 
 NODE_LABELS = {
     "start": "Task Input",
@@ -358,13 +346,12 @@ class ReplayRequest(BaseModel):
 async def replay_from_checkpoint(
     thread_id: str, 
     checkpoint_id: str, 
-    request: ReplayRequest, 
-    background_tasks: BackgroundTasks
+    request: ReplayRequest
 ):
     """
     Time-travel debugging endpoint:
     Loads the graph state at checkpoint_id, applies user-supplied context/state modifications,
-    and resumes execution from that specific moment in the background.
+    and resumes execution from that specific moment via Celery worker.
     """
     pool = await get_pool()
     checkpointer = AsyncPostgresSaver(pool)
@@ -381,7 +368,6 @@ async def replay_from_checkpoint(
     # Verify target checkpoint exists
     target_state = await app_graph.aget_state(config)
     if not target_state.values:
-        # Fallback to base thread config if specific checkpoint ID isn't found
         config = {"configurable": {"thread_id": thread_id}}
         target_state = await app_graph.aget_state(config)
         if not target_state.values:
@@ -406,16 +392,13 @@ async def replay_from_checkpoint(
     if updates:
         await app_graph.aupdate_state(config, updates)
 
-    # Background replay function
-    async def run_replay():
-        replay_config = {"configurable": {"thread_id": target_thread_id}}
-        await app_graph.ainvoke(None, replay_config)
-
-    background_tasks.add_task(run_replay)
+    # Dispatch to Celery worker to resume execution from the updated checkpoint
+    task_job = execute_agent_workflow.delay(target_thread_id, None, True)
 
     return {
         "thread_id": target_thread_id,
         "checkpoint_id": checkpoint_id,
-        "message": f"Graph replaying successfully from checkpoint {checkpoint_id}.",
+        "celery_task_id": task_job.id,
+        "message": f"Graph replaying successfully via Celery worker from checkpoint {checkpoint_id}.",
         "forked": request.fork_new_thread
     }

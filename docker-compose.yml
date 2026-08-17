@@ -3,6 +3,7 @@ version: '3.8'
 services:
   postgres:
     image: postgres:15-alpine
+    container_name: agent_postgres
     environment:
       POSTGRES_USER: agent_user
       POSTGRES_PASSWORD: agent_password
@@ -19,20 +20,71 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: agent_redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   chromadb:
     image: chromadb/chroma:latest
+    container_name: agent_chroma
     ports:
       - "8000:8000"
     volumes:
       - chroma_data:/chroma/chroma
     environment:
       - IS_PERSISTENT=TRUE
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent_fastapi
+    ports:
+      - "8080:8080"
+    environment:
+      - POSTGRES_URI=postgresql://agent_user:agent_password@postgres:5432/agent_memory
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent_celery_worker
+    environment:
+      - POSTGRES_URI=postgresql://agent_user:agent_password@postgres:5432/agent_memory
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    command: celery -A app.worker.celery_app.celery_app worker --loglevel=info --concurrency=4 -E
 
 volumes:
   postgres_data:
