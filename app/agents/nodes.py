@@ -3,19 +3,23 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from app.agents.state import AgentState, ExecutionPlan
 from app.tools.registry import ALL_TOOLS
+from app.memory.semantic import retrieve_past_context, save_memory
 
-# Initialize the LLM (ensure OPENAI_API_KEY is in your environment)
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 async def supervisor_node(state: AgentState) -> dict:
-    """Decomposes the complex task into a step-by-step execution plan."""
+    """Decomposes the task, using past semantic memories as context."""
     task = state["task_input"]
+    
+    # Query ChromaDB for past related tasks
+    past_context = retrieve_past_context(task)
     
     system_prompt = (
         "You are a Supervisor Agent. Decompose the following complex task into a step-by-step "
         "execution plan. Assign each step to a specialist: 'researcher', 'coder', or 'data_analyst'. "
         "Score your confidence in this plan (0.0 to 1.0). If the task involves sensitive operations "
-        "(like deleting data, spending money, or external emails), set requires_human_approval to true."
+        "set requires_human_approval to true.\n\n"
+        f"{past_context}"
     )
     
     structured_llm = llm.with_structured_output(ExecutionPlan)
@@ -24,7 +28,6 @@ async def supervisor_node(state: AgentState) -> dict:
         HumanMessage(content=task)
     ])
     
-    # Initialize the plan in the state
     return {"plan": plan, "current_task_index": 0, "escalation_reason": None}
 
 async def specialist_node(state: AgentState) -> dict:
@@ -36,26 +39,23 @@ async def specialist_node(state: AgentState) -> dict:
         return {}
         
     current_task = plan.subtasks[idx]
-    
-    # Bind the available tools to the LLM so it can execute actions
     worker_llm = llm.bind_tools(ALL_TOOLS)
     
     prompt = (
         f"You are a {current_task.assigned_specialist}. "
         f"Your current task: {current_task.description}\n"
         f"Expected output format: {current_task.expected_output}\n"
-        f"Previous Reviewer Feedback (if any): {state.get('reviewer_feedback', 'None')}"
+        f"Previous Reviewer Feedback: {state.get('reviewer_feedback', 'None')}"
     )
     
     response = await worker_llm.ainvoke([SystemMessage(content=prompt)] + state["messages"])
     return {"messages": [response]}
 
 async def reviewer_node(state: AgentState) -> dict:
-    """Validates the specialist's output before returning to the supervisor."""
+    """Validates the specialist's output."""
     plan = state["plan"]
     idx = state["current_task_index"]
     last_message = state["messages"][-1]
-    
     current_task = plan.subtasks[idx]
     
     prompt = (
@@ -72,15 +72,23 @@ async def reviewer_node(state: AgentState) -> dict:
         return {
             "current_task_index": idx + 1,
             "reviewer_feedback": None,
-            "messages": [AIMessage(content=f"Subtask {current_task.task_id} approved by Reviewer.")]
+            "messages": [AIMessage(content=f"Subtask {current_task.task_id} approved.")]
         }
     else:
         return {
             "reviewer_feedback": response.content,
-            "messages": [AIMessage(content=f"Reviewer rejected output. Feedback: {response.content}")]
+            "messages": [AIMessage(content=f"Reviewer rejected. Feedback: {response.content}")]
         }
 
 async def escalation_node(state: AgentState) -> dict:
     """Landing pad for Human-in-the-Loop interruptions."""
-    # When execution resumes after a human approves, it flows through this node.
     return {"escalation_reason": "Resolved by human operator."}
+
+async def memorize_node(state: AgentState) -> dict:
+    """Saves the final successful outcome into ChromaDB long-term memory."""
+    # Extract the last few messages as a summary
+    recent_messages = [msg.content for msg in state["messages"][-3:] if isinstance(msg, AIMessage)]
+    summary = "\n".join(recent_messages)
+    
+    save_memory(state["task_input"], summary)
+    return {}
