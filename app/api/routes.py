@@ -153,6 +153,15 @@ async def get_node_trace(thread_id: str, node_id: str):
             break
             
     snapshot_values = target_snapshot.values if target_snapshot else state.values
+    checkpoint_id = None
+    if target_snapshot:
+        snap_cfg = getattr(target_snapshot, "config", {}) or {}
+        configurable = snap_cfg.get("configurable", {}) if isinstance(snap_cfg, dict) else {}
+        checkpoint_id = configurable.get("checkpoint_id") or getattr(target_snapshot, "checkpoint_id", None)
+    if not checkpoint_id:
+        state_cfg = getattr(state, "config", {}) or {}
+        configurable = state_cfg.get("configurable", {}) if isinstance(state_cfg, dict) else {}
+        checkpoint_id = configurable.get("checkpoint_id") or getattr(state, "checkpoint_id", str(uuid.uuid4()))
     
     task_input = snapshot_values.get("task_input", "")
     plan = snapshot_values.get("plan")
@@ -320,6 +329,7 @@ async def get_node_trace(thread_id: str, node_id: str):
 
     return {
         "node_id": node_id,
+        "checkpoint_id": str(checkpoint_id),
         "node_label": NODE_LABELS.get(node_id, node_id),
         "status": status,
         "step": step_num,
@@ -330,9 +340,82 @@ async def get_node_trace(thread_id: str, node_id: str):
         "token_usage": token_usage,
         "subtask": subtask_data,
         "state_snapshot": {
+            "task_input": task_input,
             "current_task_index": current_idx,
             "reviewer_feedback": reviewer_feedback,
             "escalation_reason": escalation_reason,
             "total_messages": len(messages)
         }
+    }
+
+class ReplayRequest(BaseModel):
+    state_updates: Optional[Dict[str, Any]] = None
+    modified_prompt: Optional[str] = None
+    modified_response: Optional[str] = None
+    fork_new_thread: bool = False
+
+@router.post("/tasks/{thread_id}/replay/{checkpoint_id}")
+async def replay_from_checkpoint(
+    thread_id: str, 
+    checkpoint_id: str, 
+    request: ReplayRequest, 
+    background_tasks: BackgroundTasks
+):
+    """
+    Time-travel debugging endpoint:
+    Loads the graph state at checkpoint_id, applies user-supplied context/state modifications,
+    and resumes execution from that specific moment in the background.
+    """
+    pool = await get_pool()
+    checkpointer = AsyncPostgresSaver(pool)
+    app_graph = workflow.compile(checkpointer=checkpointer, interrupt_before=["escalation_node"])
+
+    target_thread_id = str(uuid.uuid4()) if request.fork_new_thread else thread_id
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_id": checkpoint_id
+        }
+    }
+
+    # Verify target checkpoint exists
+    target_state = await app_graph.aget_state(config)
+    if not target_state.values:
+        # Fallback to base thread config if specific checkpoint ID isn't found
+        config = {"configurable": {"thread_id": thread_id}}
+        target_state = await app_graph.aget_state(config)
+        if not target_state.values:
+            raise HTTPException(status_code=404, detail="Target checkpoint state not found.")
+
+    # Prepare state modifications
+    updates: Dict[str, Any] = request.state_updates or {}
+    
+    if request.modified_prompt:
+        messages = list(target_state.values.get("messages", []))
+        messages.append(HumanMessage(content=request.modified_prompt))
+        updates["messages"] = messages
+        if "task_input" not in updates:
+            updates["task_input"] = request.modified_prompt
+
+    if request.modified_response:
+        messages = list(updates.get("messages", target_state.values.get("messages", [])))
+        messages.append(AIMessage(content=request.modified_response))
+        updates["messages"] = messages
+
+    # Apply updates to graph checkpointer
+    if updates:
+        await app_graph.aupdate_state(config, updates)
+
+    # Background replay function
+    async def run_replay():
+        replay_config = {"configurable": {"thread_id": target_thread_id}}
+        await app_graph.ainvoke(None, replay_config)
+
+    background_tasks.add_task(run_replay)
+
+    return {
+        "thread_id": target_thread_id,
+        "checkpoint_id": checkpoint_id,
+        "message": f"Graph replaying successfully from checkpoint {checkpoint_id}.",
+        "forked": request.fork_new_thread
     }
