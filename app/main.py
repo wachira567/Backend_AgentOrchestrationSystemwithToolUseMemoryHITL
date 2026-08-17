@@ -4,22 +4,20 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.memory.db import get_pool, close_pool
 from app.core.config import settings
+from app.api.routes import router  # <-- Imported our new routes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- Startup ---
     pool = await get_pool()
-    
-    # Initialize LangGraph checkpointer tables in PostgreSQL automatically
     checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()
-    
     yield
-    
-    # --- Shutdown ---
     await close_pool()
 
 app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
+
+# <-- Mount the router to the application
+app.include_router(router, prefix="/api")
 
 @app.get("/health")
 async def health_check():
